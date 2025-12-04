@@ -261,12 +261,18 @@ class GazeTracker:
 
         # 8. 稳定性特征
         if len(self.eye_feature_history) >= 5:
-            history_array = np.array(self.eye_feature_history[-5:], dtype=np.float32)
-            position_std = float(np.std(history_array[:, :4]))
-            position_mean = float(np.mean(history_array[:, :4]))
+            hist_list = list(self.eye_feature_history)
+            
+            # 取最后 5 条历史记录
+            last_five = hist_list[-5:]
+
+            history_array = np.array(last_five, dtype=np.float32)
+
+            position_std = np.std(history_array[:, :4])
+            position_mean = np.mean(history_array[:, :4])
             features.extend([position_std, position_mean])
         else:
-            features.extend([0.0, 0.0])
+            features.extend([0, 0])
 
         # 保存基础位置到历史
         base_features = [left_center_x, left_center_y, right_center_x, right_center_y]

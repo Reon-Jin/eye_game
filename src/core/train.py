@@ -23,7 +23,7 @@ def countdown(frame, width, height, seconds=3):
             break
 
         # 显示倒计时数字
-        msg = f"准备校准：{remaining}"
+        msg = f"READY {remaining}"
         cv2.putText(frame, msg, (width // 2 - 200, height // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 255), 4)
 
@@ -33,7 +33,7 @@ def countdown(frame, width, height, seconds=3):
             return False  # 用户按 ESC 中断
 
     # 显示“开始采集！”
-    msg = "开始采集！"
+    msg = "START!"
     cv2.putText(frame, msg, (width // 2 - 200, height // 2),
                 cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 0), 4)
     cv2.imshow("Gaze Calibration & Training", frame)
