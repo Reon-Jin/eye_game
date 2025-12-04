@@ -1,24 +1,29 @@
 """
 Eye Gaze Tracking Module
-使用 MediaPipe Face Mesh 进行人脸检测和眼睛追踪
+使用 OpenCV Haar Cascade 和基础眼动检测进行眼球追踪
 计算视线向量（gaze vector）和眨眼检测
 """
 
 import cv2
 import numpy as np
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 from collections import deque
 
+# 加载 Haar Cascade 分类器（用于人脸和眼睛检测）
+FACE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+EYE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_eye.xml'
+
 try:
-    import mediapipe as mp
-except ImportError as e:
-    print(f"Warning: MediaPipe import failed: {e}")
-    print("Trying alternative import method...")
-    mp = None
+    face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
+    eye_cascade = cv2.CascadeClassifier(EYE_CASCADE_PATH)
+except Exception as e:
+    print(f"Warning: Failed to load Haar cascades: {e}")
+    face_cascade = None
+    eye_cascade = None
 
 
 class GazeTracker:
-    """眼动追踪器 - 基于MediaPipe Face Mesh"""
+    """眼动追踪器 - 基于OpenCV Haar Cascade眼睛检测"""
     
     def __init__(self, camera_width: int = 1280, camera_height: int = 720):
         """
@@ -31,172 +36,149 @@ class GazeTracker:
         self.camera_width = camera_width
         self.camera_height = camera_height
         
-        if mp is None:
-            raise RuntimeError("MediaPipe not available. Install with: pip install mediapipe")
+        if face_cascade is None or eye_cascade is None:
+            raise RuntimeError("Failed to load Haar cascades. OpenCV may not be properly installed.")
         
-        # MediaPipe Face Mesh 初始化
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
-        )
+        self.face_cascade = face_cascade
+        self.eye_cascade = eye_cascade
         
-        self.mp_drawing = mp.solutions.drawing_utils
-        
-        # 关键点索引 (Face Mesh Landmark Indices)
-        # 更准确的眼睛关键点索引（6个点构成眼睛轮廓）
-        self.LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
-        self.RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
-        
-        # 瞳孔位置（更精确的内部点）
-        self.LEFT_PUPIL_INDEX = 468  # 虚拟瞳孔点
-        self.RIGHT_PUPIL_INDEX = 469  # 虚拟瞳孔点
-        
-        # 眼睛内角外角（用于计算眼睛宽度）
-        self.LEFT_EYE_INNER = 33
-        self.LEFT_EYE_OUTER = 133
-        self.RIGHT_EYE_INNER = 362
-        self.RIGHT_EYE_OUTER = 263
-        
-        # 眨眼检测参数 - 优化阈值
+        # 眨眼检测参数
         self.EAR_THRESHOLD = 0.18  # Eye Aspect Ratio threshold
-        self.BLINK_CONSEC_FRAMES = 2  # 连续帧数阈值（降低以更快响应）
+        self.BLINK_CONSEC_FRAMES = 2  # 连续帧数阈值
         self.blink_counter = 0
         self.blink_detected = False
         self.last_blink_frame = -10  # 上一次眨眼的帧数
         self.blink_cooldown = 5  # 眨眼冷却时间（帧数）
         
-        # 视线向量平滑（改进的多阶段滤波）
-        self.gaze_smooth_buffer = deque(maxlen=7)  # 增加缓冲区大小，更好的平滑
-        self.gaze_smoothing_factor = 0.4  # 降低平滑因子以减少延迟
-        self.prev_gaze_coords = None  # 上一帧的坐标
-        self.coord_smooth_factor = 0.5  # 坐标平滑因子
+        # 视线向量平滑
+        self.gaze_smooth_buffer = deque(maxlen=7)
+        self.gaze_smoothing_factor = 0.4
+        self.prev_gaze_coords = None
+        self.coord_smooth_factor = 0.5
         
         # 校准参数
         self.calibrated = False
         self.calibration_points = []
         self.screen_points = []
-        self.gaze_calibration_matrix = None  # 校准矩阵
         
         # 调试信息
-        self.last_ear_left = 0
-        self.last_ear_right = 0
+        self.last_ear_left = 0.0
+        self.last_ear_right = 0.0
         
-        # 摄像头位置补正（对于正上方摄像头的特殊处理）
-        self.camera_height_offset = -0.15  # Y轴偏移量，向上调整（负值）
+        # 摄像头位置补正
+        self.camera_height_offset = -0.15
         
-    def calculate_eye_aspect_ratio(self, eye_points: np.ndarray) -> float:
+        # 眼睛位置历史（用于平滑）
+        self.left_eye_history = deque(maxlen=5)
+        self.right_eye_history = deque(maxlen=5)
+        
+        # 上一帧的眼睛状态
+        self.prev_left_eye_state = None
+        self.prev_right_eye_state = None
+        
+    def calculate_eye_aspect_ratio(self, eye_region: np.ndarray) -> float:
         """
-        计算眼睛宽高比（Eye Aspect Ratio）
+        基于眼睛区域计算眼睛宽高比
         
         Args:
-            eye_points: 眼睛6个关键点的坐标 (6, 2)
+            eye_region: 眼睛ROI区域
             
         Returns:
-            眼睛宽高比
+            眼睛宽高比（0-1）
         """
-        # 计算眼睛的纵向距离
-        A = np.linalg.norm(eye_points[1] - eye_points[5])
-        B = np.linalg.norm(eye_points[2] - eye_points[4])
+        if eye_region is None or eye_region.size == 0:
+            return 1.0
         
-        # 计算眼睛的横向距离
-        C = np.linalg.norm(eye_points[0] - eye_points[3])
+        # 计算眼睛区域的填充比例（作为宽高比的代理）
+        # 眼睛闭合时，区域会变小或变暗
+        h, w = eye_region.shape[:2]
+        if h == 0 or w == 0:
+            return 1.0
+        
+        # 计算区域的亮度平均值（眼睛打开时较亮）
+        gray = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY) if len(eye_region.shape) == 3 else eye_region
+        brightness = np.mean(gray) / 255.0
         
         # 计算宽高比
-        ear = (A + B) / (2.0 * C)
+        aspect_ratio = min(w, h) / max(w, h, 1)
+        
+        # 综合考虑宽高比和亮度
+        ear = brightness * aspect_ratio
         return ear
     
-    def get_pupil_position(self, eye_points: np.ndarray) -> Tuple[float, float]:
+    def smooth_eye_position(self, eye_rect: Tuple[int, int, int, int], is_left: bool = True) -> Optional[Tuple[int, int, int, int]]:
         """
-        计算瞳孔位置（眼睛关键点的中心）
+        平滑眼睛位置以减少检测噪声
         
         Args:
-            eye_points: 眼睛关键点坐标 (6, 2)
+            eye_rect: 眼睛矩形 (x, y, w, h)
+            is_left: 是否为左眼
             
         Returns:
-            瞳孔中心坐标 (x, y)
+            平滑后的眼睛位置或None
         """
-        pupil_x = np.mean(eye_points[:, 0])
-        pupil_y = np.mean(eye_points[:, 1])
-        return pupil_x, pupil_y
+        if eye_rect is None:
+            return None
+        
+        # 使用历史缓冲区平滑
+        history = self.left_eye_history if is_left else self.right_eye_history
+        history.append(eye_rect)
+        
+        if len(history) > 0:
+            avg_x = int(np.mean([r[0] for r in history]))
+            avg_y = int(np.mean([r[1] for r in history]))
+            avg_w = int(np.mean([r[2] for r in history]))
+            avg_h = int(np.mean([r[3] for r in history]))
+            return (avg_x, avg_y, avg_w, avg_h)
+        
+        return None
     
-    def estimate_gaze_vector(self, 
-                            face_landmarks: np.ndarray,
-                            left_eye_indices: list,
-                            right_eye_indices: list) -> np.ndarray:
+    def estimate_gaze_vector(self, left_eye_rect: Tuple, right_eye_rect: Tuple, face_rect: Tuple) -> np.ndarray:
         """
-        改进的视线向量估计（基于瞳孔在眼睛框架中的位置）
-        使用虚拟瞳孔点（468，469）以获得更准确的视线方向
+        基于眼睛位置估计视线向量
         
         Args:
-            face_landmarks: 全部面部特征点 (468, 2)
-            left_eye_indices: 左眼关键点索引
-            right_eye_indices: 右眼关键点索引
+            left_eye_rect: 左眼矩形 (x, y, w, h)
+            right_eye_rect: 右眼矩形 (x, y, w, h)
+            face_rect: 脸部矩形 (x, y, w, h)
             
         Returns:
             归一化的视线向量 (2,)，范围约为 [-1, 1]
         """
-        # 获取眼睛特征点
-        left_eye_points = face_landmarks[left_eye_indices]
-        right_eye_points = face_landmarks[right_eye_indices]
+        if left_eye_rect is None or right_eye_rect is None:
+            return np.array([0.0, 0.0], dtype=np.float32)
         
-        # 获取虚拟瞳孔点（468和469是MediaPipe的虚拟瞳孔点）
-        try:
-            left_pupil = face_landmarks[468]
-            right_pupil = face_landmarks[469]
-        except:
-            # 如果没有虚拟瞳孔点，使用眼睛中心
-            left_pupil = np.mean(left_eye_points, axis=0)
-            right_pupil = np.mean(right_eye_points, axis=0)
+        # 提取眼睛中心位置
+        left_eye_center_x = left_eye_rect[0] + left_eye_rect[2] // 2
+        left_eye_center_y = left_eye_rect[1] + left_eye_rect[3] // 2
+        right_eye_center_x = right_eye_rect[0] + right_eye_rect[2] // 2
+        right_eye_center_y = right_eye_rect[1] + right_eye_rect[3] // 2
         
-        # 计算眼睛边界（外角和内角）
-        left_eye_inner = face_landmarks[self.LEFT_EYE_INNER]
-        left_eye_outer = face_landmarks[self.LEFT_EYE_OUTER]
-        right_eye_inner = face_landmarks[self.RIGHT_EYE_INNER]
-        right_eye_outer = face_landmarks[self.RIGHT_EYE_OUTER]
+        # 平均眼睛位置
+        avg_eye_x = (left_eye_center_x + right_eye_center_x) / 2.0
+        avg_eye_y = (left_eye_center_y + right_eye_center_y) / 2.0
         
-        # 计算上下边界（用于Y轴）
-        left_eye_top = (left_eye_points[1] + left_eye_points[2]) / 2  # 上方点
-        left_eye_bottom = (left_eye_points[4] + left_eye_points[5]) / 2  # 下方点
-        right_eye_top = (right_eye_points[1] + right_eye_points[2]) / 2
-        right_eye_bottom = (right_eye_points[4] + right_eye_points[5]) / 2
+        # 脸部中心
+        face_center_x = face_rect[0] + face_rect[2] // 2
+        face_center_y = face_rect[1] + face_rect[3] // 2
         
-        # 计算眼睛的有效范围
-        left_eye_width = np.linalg.norm(left_eye_outer - left_eye_inner)
-        left_eye_height = np.linalg.norm(left_eye_bottom - left_eye_top)
-        right_eye_width = np.linalg.norm(right_eye_outer - right_eye_inner)
-        right_eye_height = np.linalg.norm(right_eye_bottom - right_eye_top)
+        # 计算相对于脸部中心的眼睛位置（归一化）
+        # X: -1 (左) 到 1 (右)
+        # Y: -1 (上) 到 1 (下)
+        max_horizontal_offset = face_rect[2] / 3.0
+        max_vertical_offset = face_rect[3] / 4.0
         
-        # 计算瞳孔相对于眼睛的归一化位置
-        # X方向：-1 = 看左，0 = 看中央，1 = 看右
-        # 使用内外角作为范围边界
-        left_eye_width_factor = left_eye_width * 1.1  # 稍微扩大范围以获得更好的外围覆盖
-        right_eye_width_factor = right_eye_width * 1.1
+        gaze_x = (avg_eye_x - face_center_x) / max_horizontal_offset
+        gaze_y = (avg_eye_y - face_center_y) / max_vertical_offset
         
-        left_gaze_x = (left_pupil[0] - left_eye_inner[0]) / (left_eye_width_factor + 1e-6) - 0.5
-        right_gaze_x = (right_pupil[0] - right_eye_inner[0]) / (right_eye_width_factor + 1e-6) - 0.5
+        # 应用摄像头位置补正
+        gaze_y += self.camera_height_offset
         
-        # Y方向：-1 = 看上，0 = 看中央，1 = 看下
-        left_eye_height_factor = left_eye_height * 1.1
-        right_eye_height_factor = right_eye_height * 1.1
+        # 约束范围
+        gaze_x = np.clip(gaze_x, -1.0, 1.0)
+        gaze_y = np.clip(gaze_y, -0.8, 0.8)
         
-        left_gaze_y = (left_pupil[1] - left_eye_top[1]) / (left_eye_height_factor + 1e-6) - 0.5
-        right_gaze_y = (right_pupil[1] - right_eye_top[1]) / (right_eye_height_factor + 1e-6) - 0.5
-        
-        # 平均左右眼以获得更稳定的视线估计
-        avg_gaze_x = (left_gaze_x + right_gaze_x) / 2.0
-        avg_gaze_y = (left_gaze_y + right_gaze_y) / 2.0
-        
-        # 应用摄像头位置补正（因为摄像头在屏幕正上方）
-        avg_gaze_y += self.camera_height_offset
-        
-        # 约束在合理范围内（允许一定的超出范围以提高边缘准确性）
-        avg_gaze_x = np.clip(avg_gaze_x, -1.0, 1.0)
-        avg_gaze_y = np.clip(avg_gaze_y, -0.8, 0.8)
-        
-        gaze_vector = np.array([avg_gaze_x, avg_gaze_y], dtype=np.float32)
+        gaze_vector = np.array([gaze_x, gaze_y], dtype=np.float32)
         
         # 应用平滑滤波
         gaze_vector = self._smooth_gaze_vector(gaze_vector)
@@ -279,53 +261,52 @@ class GazeTracker:
         
         return int(screen_x), int(screen_y)
     
-    def detect_left_blink(self, face_landmarks: np.ndarray, frame_id: int = 0) -> bool:
+    def detect_left_blink(self, left_eye_region: np.ndarray, frame_id: int = 0) -> bool:
         """
-        改进的左眼眨眼检测，使用EAR和时间管理
-        防止眨眼过程中的准心晃动
+        基于眼睛区域的眨眼检测
         
         Args:
-            face_landmarks: 面部特征点 (468, 2)
-            frame_id: 当前帧ID（用于冷却时间）
+            left_eye_region: 左眼ROI区域
+            frame_id: 当前帧ID
             
         Returns:
             是否检测到左眼眨眼
         """
-        left_eye = face_landmarks[self.LEFT_EYE_INDICES]
-        ear = self.calculate_eye_aspect_ratio(left_eye)
+        if left_eye_region is None or left_eye_region.size == 0:
+            return False
+        
+        # 计算左眼的宽高比
+        ear = self.calculate_eye_aspect_ratio(left_eye_region)
         self.last_ear_left = ear
         
         # 检测眨眼：EAR下降
         if ear < self.EAR_THRESHOLD:
             self.blink_counter += 1
         else:
-            # 眨眼恢复（眼睛张开）
+            # 眼睛打开
             if self.blink_counter >= self.BLINK_CONSEC_FRAMES:
-                # 检查冷却时间（避免双重触发）
+                # 检查冷却时间
                 if frame_id - self.last_blink_frame > self.blink_cooldown:
                     self.blink_detected = True
                     self.last_blink_frame = frame_id
-                    # 关键：当眨眼触发时，锁定当前的准心位置，防止眨眼恢复时的晃动
-                    if self.prev_gaze_coords is not None:
-                        # 保留上一个稳定的坐标
-                        pass
             self.blink_counter = 0
         
         return self.blink_detected
     
-    def detect_right_blink(self, face_landmarks: np.ndarray, frame_id: int = 0) -> bool:
+    def detect_right_blink(self, right_eye_region: np.ndarray) -> bool:
         """
-        右眼眨眼检测（可选，用于调试或其他功能）
+        右眼眨眼检测
         
         Args:
-            face_landmarks: 面部特征点 (468, 2)
-            frame_id: 当前帧ID
+            right_eye_region: 右眼ROI区域
             
         Returns:
             是否检测到右眼眨眼
         """
-        right_eye = face_landmarks[self.RIGHT_EYE_INDICES]
-        ear = self.calculate_eye_aspect_ratio(right_eye)
+        if right_eye_region is None or right_eye_region.size == 0:
+            return False
+        
+        ear = self.calculate_eye_aspect_ratio(right_eye_region)
         self.last_ear_right = ear
         
         if ear < self.EAR_THRESHOLD:
@@ -334,22 +315,17 @@ class GazeTracker:
     
     def process_frame(self, frame: np.ndarray, frame_id: int = 0) -> Dict:
         """
-        处理单帧图像，检测人脸和计算视线
-        改进：在眨眼期间锁定准心以防止晃动
+        处理单帧图像，检测人脸和眼睛，计算视线
         
         Args:
-            frame: 输入图像 (H, W, 3)
-            frame_id: 当前帧ID（用于眨眼冷却计算）
+            frame: 输入图像 (H, W, 3) BGR格式
+            frame_id: 当前帧ID
             
         Returns:
             包含追踪结果的字典
         """
-        # 转换为RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w = frame.shape[:2]
-        
-        # 运行Face Mesh
-        results = self.face_mesh.process(frame_rgb)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         result_dict = {
             'face_detected': False,
@@ -360,67 +336,131 @@ class GazeTracker:
             'left_eye_ear': None,
             'right_eye_ear': None,
             'face_confidence': 0.0,
-            'blink_triggered': False  # 是否真正触发了射击
+            'blink_triggered': False
         }
         
-        if results.multi_face_landmarks and len(results.multi_face_landmarks) > 0:
-            landmarks = results.multi_face_landmarks[0]
-            # 转换为像素坐标
-            face_landmarks = np.array([[lm.x * w, lm.y * h] for lm in landmarks.landmark])
-            
-            result_dict['face_detected'] = True
-            result_dict['landmarks'] = face_landmarks
-            result_dict['face_confidence'] = 0.9  # MediaPipe没有直接提供置信度
-            
-            # 计算视线向量
-            gaze_vector = self.estimate_gaze_vector(
-                face_landmarks,
-                self.LEFT_EYE_INDICES,
-                self.RIGHT_EYE_INDICES
+        try:
+            # 检测人脸
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30),
+                flags=cv2.CASCADE_SCALE_IMAGE
             )
-            result_dict['gaze_vector'] = gaze_vector
             
-            # 转换为屏幕坐标
-            screen_coords = self.gaze_to_screen_coords(gaze_vector, w, h)
-            result_dict['gaze_screen_coords'] = screen_coords
-            
-            # 计算眼睛宽高比
-            left_ear = self.calculate_eye_aspect_ratio(face_landmarks[self.LEFT_EYE_INDICES])
-            right_ear = self.calculate_eye_aspect_ratio(face_landmarks[self.RIGHT_EYE_INDICES])
-            result_dict['left_eye_ear'] = left_ear
-            result_dict['right_eye_ear'] = right_ear
-            
-            # 检测左眼眨眼（开火动作）
-            blink_state = self.detect_left_blink(face_landmarks, frame_id)
-            result_dict['blink_detected'] = blink_state
-            
-            if blink_state:
-                result_dict['blink_triggered'] = True
-                self.blink_detected = False  # 重置
+            if len(faces) > 0:
+                # 取第一个检测到的人脸
+                (fx, fy, fw, fh) = faces[0]
+                result_dict['face_detected'] = True
+                result_dict['face_confidence'] = 0.8
+                
+                # 在人脸区域中检测眼睛
+                face_roi = gray[fy:fy + fh, fx:fx + fw]
+                eyes = self.eye_cascade.detectMultiScale(
+                    face_roi,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(15, 15)
+                )
+                
+                if len(eyes) >= 2:
+                    # 按照X坐标排序眼睛（左眼在前）
+                    eyes = sorted(eyes, key=lambda e: e[0])
+                    
+                    # 提取左右眼
+                    left_eye_rect_roi = eyes[0]
+                    right_eye_rect_roi = eyes[1]
+                    
+                    # 转换为全图坐标
+                    left_eye_rect = (
+                        fx + left_eye_rect_roi[0],
+                        fy + left_eye_rect_roi[1],
+                        left_eye_rect_roi[2],
+                        left_eye_rect_roi[3]
+                    )
+                    right_eye_rect = (
+                        fx + right_eye_rect_roi[0],
+                        fy + right_eye_rect_roi[1],
+                        right_eye_rect_roi[2],
+                        right_eye_rect_roi[3]
+                    )
+                    
+                    # 平滑眼睛位置
+                    left_eye_rect = self.smooth_eye_position(left_eye_rect, is_left=True)
+                    right_eye_rect = self.smooth_eye_position(right_eye_rect, is_left=False)
+                    
+                    if left_eye_rect is not None and right_eye_rect is not None:
+                        # 提取眼睛区域用于EAR计算
+                        lx, ly, lw, lh = left_eye_rect
+                        rx, ry, rw, rh = right_eye_rect
+                        
+                        left_eye_region = frame[ly:ly + lh, lx:lx + lw]
+                        right_eye_region = frame[ry:ry + rh, rx:rx + rw]
+                        
+                        # 计算视线向量
+                        gaze_vector = self.estimate_gaze_vector(left_eye_rect, right_eye_rect, (fx, fy, fw, fh))
+                        result_dict['gaze_vector'] = gaze_vector
+                        
+                        # 转换为屏幕坐标
+                        screen_coords = self.gaze_to_screen_coords(gaze_vector, w, h)
+                        result_dict['gaze_screen_coords'] = screen_coords
+                        
+                        # 检测眨眼
+                        blink_state = self.detect_left_blink(left_eye_region, frame_id)
+                        result_dict['blink_detected'] = blink_state
+                        
+                        if blink_state:
+                            result_dict['blink_triggered'] = True
+                            self.blink_detected = False  # 重置
+                        
+                        # 获取EAR值
+                        self.detect_right_blink(right_eye_region)
+                        result_dict['left_eye_ear'] = self.last_ear_left
+                        result_dict['right_eye_ear'] = self.last_ear_right
+        
+        except Exception as e:
+            print(f"Error in process_frame: {e}")
+            pass
         
         return result_dict
     
-    def draw_landmarks(self, frame: np.ndarray, landmarks: np.ndarray) -> np.ndarray:
+    def draw_landmarks(self, frame: np.ndarray, landmarks: np.ndarray = None) -> np.ndarray:
         """
-        在图像上绘制面部特征点（用于调试）
+        在图像上绘制眼睛检测区域（用于调试）
         
         Args:
             frame: 输入图像
-            landmarks: 面部特征点坐标 (468, 2)
+            landmarks: 面部特征点坐标（此参数在Haar Cascade版本中未使用）
             
         Returns:
             绘制后的图像
         """
-        if landmarks is None:
-            return frame
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # 绘制眼睛关键点
-        for idx in self.LEFT_EYE_INDICES:
-            x, y = int(landmarks[idx, 0]), int(landmarks[idx, 1])
-            cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
+        # 检测人脸
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30)
+        )
         
-        for idx in self.RIGHT_EYE_INDICES:
-            x, y = int(landmarks[idx, 0]), int(landmarks[idx, 1])
-            cv2.circle(frame, (x, y), 3, (255, 0, 0), -1)
+        if len(faces) > 0:
+            # 绘制人脸矩形
+            for (fx, fy, fw, fh) in faces:
+                cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (255, 0, 0), 2)
+            
+            # 在人脸区域中检测眼睛
+            face_roi = gray[fy:fy + fh, fx:fx + fw]
+            eyes = self.eye_cascade.detectMultiScale(face_roi)
+            
+            # 绘制眼睛矩形
+            for (ex, ey, ew, eh) in eyes:
+                cv2.rectangle(frame, (fx + ex, fy + ey), (fx + ex + ew, fy + ey + eh), (0, 255, 0), 2)
+        
+        cv2.putText(frame, "OpenCV Haar Cascade Eye Tracking", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         return frame
