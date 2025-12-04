@@ -2,32 +2,49 @@
 
 一个基于 OpenCV 和 MediaPipe 的眼动追踪射击游戏。玩家通过视线方向控制准心，左眨眼触发射击。
 
+## 🎉 最新改进（v1.1.0）
+
+### 眼动追踪增强
+- ✨ **改进的视线向量估计**：更精确的基于瞳孔位置的计算
+- 🎯 **视线平滑处理**：低通滤波减少准心抖动
+- 🔧 **优化的眨眼检测**：降低 EAR 阈值，增加冷却时间防止误触
+- 📊 **实时眼睛宽高比显示**：调试时显示 L-EAR 和 R-EAR 值
+
+### 游戏体验改进
+- 💥 **眨眼视觉反馈**：射击时准心显示闪光效果
+- ⚙️ **动态敏感度调整**：游戏中按 `-/=` 键实时调整眨眼灵敏度
+- 🖱️ **改进的准心映射**：非线性映射提高准确性
+- 📈 **增强的调试信息**：显示更多实时参数
+
 ## 功能特性
 
 ✨ **核心功能：**
 - 🎯 **眼动追踪**：使用 MediaPipe Face Mesh 进行高精度眼球追踪
 - 👁️ **准心控制**：实时将视线向量映射到屏幕坐标
-- 🔫 **眨眼射击**：通过左眼眨眼触发射击机制
+- 🔫 **眨眼射击**：通过左眼眨眼触发射击机制（改进的检测）
 - 🎮 **游戏引擎**：支持多个移动靶子、碰撞检测、计分系统
 - 📈 **难度递进**：随着分数增加，靶子数量和生成速度增加
-- 🖥️ **实时UI**：显示分数、等级、FPS等信息
+- 🖥️ **实时UI**：显示分数、等级、FPS、调试信息
 
 ## 技术架构
 
 ```
 Eye Shooter/
 ├── main.py                  # 主程序入口
-├── config.py               # 配置文件
+├── config.py               # 优化的配置文件
 ├── requirements.txt        # 依赖包列表
+├── test_modules.py         # 测试脚本
+├── QUICKSTART.md          # 快速开始指南
+├── README.md              # 本文件
 ├── src/
 │   ├── __init__.py
 │   ├── core/
 │   │   ├── __init__.py
-│   │   └── gaze_tracker.py  # 眼动追踪模块
+│   │   └── gaze_tracker.py  # 眼动追踪模块（改进版）
 │   └── game/
 │       ├── __init__.py
 │       └── game_engine.py   # 游戏引擎模块
-└── README.md               # 本文件
+└── assets/                 # 资源文件夹（可用于扩展）
 ```
 
 ## 模块说明
@@ -38,17 +55,19 @@ Eye Shooter/
 
 #### 主要功能：
 - **Face Mesh 检测**：使用 MediaPipe 检测面部 468 个特征点
-- **瞳孔定位**：从眼睛关键点计算瞳孔中心位置
-- **视线向量估计**：基于瞳孔相对于眼睛的位置计算 gaze vector
-- **眨眼检测**：通过眼睛宽高比（EAR）检测眨眼动作
-- **坐标映射**：将视线向量转换为屏幕像素坐标
+- **改进的瞳孔定位**：更准确的眼睛内部特征点计算
+- **改进的视线向量估计**：基于瞳孔相对于眼睛的位置计算 gaze vector
+- **优化的眨眼检测**：通过眼睛宽高比（EAR）和冷却时间机制
+- **视线平滑处理**：低通滤波减少噪声
+- **改进的坐标映射**：非线性映射提高准确性
 
-#### 关键算法：
+#### 关键算法改进：
 
 **1. 眼睛宽高比（Eye Aspect Ratio, EAR）**
 ```
 EAR = (||p2 - p6|| + ||p3 - p5||) / (2 * ||p1 - p4||)
 ```
+改进：降低阈值从 0.20 到 0.18，更快响应眨眼
 其中 p1-p6 是眼睛的 6 个特征点。当 EAR < 阈值时，判定为眨眼。
 
 **2. 视线向量估计**
@@ -154,17 +173,18 @@ python main.py
 
 | 按键 | 功能 |
 |------|------|
-| **Space** | 开始/暂停游戏 |
+| **Space** | 开始/暂停/继续游戏 |
 | **D** | 切换调试信息显示 |
 | **L** | 切换面部特征点显示 |
 | **R** | 重置游戏 |
+| **-/=** | 调整眨眼敏感度（实时调整EAR阈值）|
 | **ESC** | 退出程序 |
 
 ### 5. 游戏规则
 
 1. **启动游戏**：按 Space 开始
 2. **控制准心**：通过改变视线方向控制准心（黄色十字）
-3. **射击**：左眨眼触发射击（需要明显的眨眼动作）
+3. **射击**：左眨眼触发射击（需要明显的眨眼动作，可按-/=调整灵敏度）
 4. **击中靶子**：准心与绿色靶子碰撞时得 10 分
 5. **升级机制**：每 10 分升一级，靶子增多、移动更快
 
@@ -177,50 +197,100 @@ python main.py
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 
-# 眨眼检测
-EYE_ASPECT_RATIO_THRESHOLD = 0.2    # 降低此值使眨眼更容易检测
-BLINK_CONSEC_FRAMES = 3             # 眨眼连续帧数
+# 眨眼检测（v1.1.0 改进）
+EYE_ASPECT_RATIO_THRESHOLD = 0.18    # 降低此值使眨眼更容易检测（原为0.2）
+BLINK_CONSEC_FRAMES = 2              # 眨眼连续帧数（原为3）
+BLINK_COOLDOWN = 5                   # 眨眼冷却时间，防止连续触发
+
+# 视线平滑
+GAZE_SMOOTHING_FACTOR = 0.6          # 平滑因子 (0-1，越大越平滑)
+GAZE_SMOOTH_BUFFER_SIZE = 3          # 历史缓冲区大小
 
 # 游戏设置
-INITIAL_TARGET_SPAWN_INTERVAL = 60  # 靶子生成间隔
-MAX_INITIAL_TARGETS = 3             # 初始最大靶子数
+INITIAL_TARGET_SPAWN_INTERVAL = 60   # 靶子生成间隔
+MAX_INITIAL_TARGETS = 3              # 初始最大靶子数
 ```
 
 ## 故障排除
 
-### 问题 1：无法打开摄像头
+### 问题 1：MediaPipe DLL 加载错误（Windows）
+
 ```
+错误信息：ImportError: DLL load failed while importing _framework_bindings
 解决方案：
-1. 检查摄像头是否被其他程序占用
-2. 尝试修改 main.py 中的 camera_id（0, 1, 2...）
-3. 检查摄像头权限
+1. 创建新的虚拟环境（推荐）
+   conda create -n eye_shooter python=3.9 -y
+   conda activate eye_shooter
+   pip install opencv-python mediapipe numpy
+
+2. 或者使用 Conda 安装 MediaPipe
+   conda install mediapipe -c conda-forge -y
+
+3. 如果仍然失败，尝试旧版本
+   pip uninstall mediapipe -y
+   pip install mediapipe==0.9.3.0
 ```
 
-### 问题 2：无法检测到人脸
+### 问题 2：无法打开摄像头
+```
+解决方案：
+1. 检查摄像头是否被其他程序占用（Zoom、Teams等）
+2. 尝试修改 main.py 中的 camera_id（0, 1, 2...）
+3. 检查摄像头权限（Windows 10/11 设置 > 隐私）
+4. 重启计算机或更新摄像头驱动
+```
+
+### 问题 3：无法检测到人脸
 ```
 解决方案：
 1. 确保充足的光照（MediaPipe 对光线敏感）
+   - 增加房间照明
+   - 避免强逆光
 2. 调整脸部到摄像头中央
-3. 确保脸部完全在画面内
+3. 确保脸部完全在画面内（不要部分遮挡）
 4. 尝试调整摄像头距离（30-60cm 最佳）
+5. 确认摄像头镜头清洁
 ```
 
-### 问题 3：眨眼不能触发射击
+### 问题 4：眨眼不能触发射击（v1.1.0 新增调试）
 ```
-解决方案：
-1. 按 D 查看 EAR（Eye Aspect Ratio）值
-2. 根据实际 EAR 值调整 config.py 中的阈值
-3. 确保是左眼眨眼（右眼绿色点，左眼蓝色点）
-4. 尝试更大幅度地眨眼
+解决方案（使用新的调试工具）：
+1. 启动游戏后按 D 显示调试信息
+2. 观察 "L-EAR" 和 "R-EAR" 值（实时显示）
+3. 在日常情况下，左眼 EAR 通常为 0.25-0.35
+4. 用力眨眼时，EAR 降至 0.10-0.15
+5. 根据需要调整：
+   - 眨眼敏感，但容易误触 → 按 - 降低灵敏度（增加阈值）
+   - 眨眼不灵敏 → 按 = 提高灵敏度（降低阈值）
+6. 观察 "Blink Threshold" 显示当前 EAR 阈值
 ```
 
-### 问题 4：准心不跟踪准确
+### 问题 5：准心不跟踪准确（改进的诊断）
 ```
 解决方案：
-1. 按 L 显示面部特征点，检查检测是否准确
+1. 按 L 显示面部特征点
+   - 蓝色点应该在左眼轮廓上
+   - 绿色点应该在右眼轮廓上
+   - 如果不准确，调整摄像头角度
 2. 调整摄像头位置和角度
+   - 摄像头应该与眼睛水平或略上方
+   - 距离脸部 30-60cm
 3. 在不同光线条件下测试
-4. 可以修改 gaze_tracker.py 中的映射参数微调
+4. 如需微调映射，修改 gaze_tracker.py 中的：
+   - estimate_gaze_vector() 方法中的范围约束
+   - gaze_to_screen_coords() 方法中的映射公式
+```
+
+### 问题 6：游戏 FPS 过低
+```
+解决方案：
+1. 关闭特征点显示（按 L）→ 可提升 5-10 FPS
+2. 降低分辨率：
+   - 在 config.py 修改 RESOLUTION_PRESET
+   - 改为 "medium" 或 "low"
+3. 关闭调试信息（按 D）
+4. 关闭其他应用释放系统资源
+5. 检查是否有后台病毒扫描程序运行
 ```
 
 ### 问题 5：FPS 过低
@@ -269,6 +339,42 @@ MAX_INITIAL_TARGETS = 3             # 初始最大靶子数
 - [ ] 移动端适配（Android/iOS）
 - [ ] AI 对手和任务关卡
 
+## 更新日志
+
+### v1.1.0 (2025-12-04) - 眼动追踪和开火功能完善
+
+**改进的眼动追踪**
+- ✨ 更精确的视线向量估计算法
+- 🎯 添加低通滤波平滑处理
+- 🔧 优化眨眼检测（EAR 阈值: 0.20→0.18）
+- ⏱️ 添加眨眼冷却机制防止误触
+- 📊 实时显示左右眼 EAR 值
+
+**游戏体验改进**
+- 💥 射击时添加准心闪光效果
+- ⚙️ 游戏中实时调整眨眼灵敏度（按-/=）
+- 🖱️ 改进准心映射算法，提高准确性
+- 📈 增强调试信息显示
+- 🧪 添加完整的测试脚本
+
+**新增功能**
+- 🎯 视线向量平滑缓冲区
+- 🔍 动态灵敏度调整
+- 📝 详细的故障排除指南
+- 💡 快速开始指南（QUICKSTART.md）
+
+**Bug 修复**
+- 修复眨眼误触多次的问题
+- 改进 MediaPipe 导入错误处理
+- 优化高分辨率下的性能
+
+### v1.0.0 (2025-12-04) - 初始版本
+
+- ✅ 完成眼动追踪模块
+- ✅ 完成游戏引擎和 UI
+- ✅ 支持基础游戏流程
+- ✅ 添加调试工具
+
 ## 代码示例
 
 ### 自定义游戏参数
@@ -291,6 +397,17 @@ engine.max_targets = 5
 engine.start_game()
 ```
 
+### 在游戏中动态调整参数
+
+```python
+# 在 main.py 中调整眨眼灵敏度
+# 按 - 键降低灵敏度（增加 EAR 阈值）
+# 按 = 键提高灵敏度（降低 EAR 阈值）
+
+# 或者在代码中直接修改
+tracker.EAR_THRESHOLD = 0.16  # 调整阈值
+```
+
 ### 集成到其他应用
 
 ```python
@@ -303,7 +420,7 @@ def integrate_gaze_tracking(frame):
     
     if result['face_detected']:
         gaze_x, gaze_y = result['gaze_screen_coords']
-        is_blink = result['blink_detected']
+        is_blink = result['blink_triggered']
         
         # 你的自定义逻辑
         print(f"Gaze at ({gaze_x}, {gaze_y}), Blink: {is_blink}")
@@ -311,14 +428,46 @@ def integrate_gaze_tracking(frame):
     return result
 ```
 
+## 快速参考
+
+### 关键文件位置
+
+| 文件 | 用途 | 修改频率 |
+|------|------|---------|
+| `main.py` | 游戏主程序 | 很低 |
+| `config.py` | 配置参数 | 中等（调试时） |
+| `src/core/gaze_tracker.py` | 眼动追踪算法 | 低（高级优化） |
+| `src/game/game_engine.py` | 游戏逻辑 | 低（扩展功能） |
+| `test_modules.py` | 测试脚本 | 低 |
+| `QUICKSTART.md` | 快速开始 | 从这里开始！ |
+
+### 最常用的命令
+
+```bash
+# 启动游戏
+python main.py
+
+# 运行测试
+python test_modules.py
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 创建虚拟环境（推荐）
+conda create -n eye_shooter python=3.9 -y
+conda activate eye_shooter
+pip install opencv-python mediapipe numpy
+```
+
 ## 技术栈
 
 | 组件 | 技术 | 版本 |
 |------|------|------|
-| 人脸检测 | MediaPipe Face Mesh | 0.10.8 |
-| 图像处理 | OpenCV | 4.8.1 |
-| 数值计算 | NumPy | 1.24.3 |
-| 语言 | Python | 3.7+ |
+| 人脸检测 | MediaPipe Face Mesh | 0.10.8+ |
+| 图像处理 | OpenCV | 4.8.1+ |
+| 数值计算 | NumPy | 1.24.3+ |
+| 语言 | Python | 3.9+ |
+| 操作系统 | Windows/Linux/macOS | 任意 |
 
 ## 参考资源
 
@@ -326,24 +475,27 @@ def integrate_gaze_tracking(frame):
 - [OpenCV 官方文档](https://docs.opencv.org/)
 - [眼动追踪原理](https://en.wikipedia.org/wiki/Eye_tracking)
 - [眼睛宽高比论文](https://ieeexplore.ieee.org/document/5891805)
+- [MediaPipe 安装指南](https://developers.google.com/mediapipe/framework/getting_started/install)
 
 ## 许可证
 
-MIT License
+MIT License - 自由使用和修改
 
-## 作者
+## 作者和贡献者
 
 Created with ❤️ for eye-tracking enthusiasts
 
-## 更新日志
+## 获取帮助
 
-### v1.0.0 (2025-12-04)
-- ✅ 完成眼动追踪模块
-- ✅ 完成游戏引擎和 UI
-- ✅ 支持基础游戏流程
-- ✅ 添加调试工具
+如果遇到问题：
+1. 查看 `QUICKSTART.md` 快速开始指南
+2. 查看本文件的故障排除部分
+3. 运行 `python test_modules.py` 检查环境
+4. 按 D 显示调试信息了解实时状态
 
 ---
 
-**享受游戏！** 🎮👀
+**祝你游戏愉快！** 🎮👀
+
+*Latest Update: v1.1.0 (2025-12-04)*
 

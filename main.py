@@ -53,21 +53,33 @@ class EyeShooterApp:
         # 性能监测
         self.fps = 30
         self.frame_count = 0
+        self.last_blink_time = 0  # 上一次眨眼的帧数
+        
+        # 保存EAR信息用于调试
+        self.last_ear_left = 0
+        self.last_ear_right = 0
         
         print("=" * 60)
         print("Eye Shooter - Gaze-Controlled Shooting Game")
         print("=" * 60)
         print("\nControls:")
-        print("  Space: Start/Pause game")
+        print("  Space: Start/Pause/Resume game")
         print("  D: Toggle debug info")
         print("  L: Toggle landmarks display")
         print("  R: Reset game")
+        print("  -/=: Adjust blink sensitivity")
         print("  ESC: Quit")
         print("\nGame Rules:")
-        print("  - Move crosshair with your gaze")
-        print("  - Blink left eye to shoot")
+        print("  - Move crosshair with your gaze direction")
+        print("  - Blink LEFT eye to shoot")
         print("  - Hit targets to increase score")
-        print("\n" + "=" * 60 + "\n")
+        print("  - Game becomes harder as you level up")
+        print("\n" + "=" * 60)
+        print("Tips:")
+        print("  - Good lighting improves face detection")
+        print("  - Keep your face at 30-60cm from camera")
+        print("  - Use - and = keys to adjust blink sensitivity")
+        print("=" * 60 + "\n")
     
     def draw_ui(self, frame: np.ndarray) -> np.ndarray:
         """绘制UI元素"""
@@ -77,7 +89,7 @@ class EyeShooterApp:
         cx, cy = self.game_engine.crosshair_x, self.game_engine.crosshair_y
         size = self.game_engine.crosshair_size
         
-        # 准心十字
+        # 准心十字（黄色）
         cv2.line(frame, (cx - size, cy), (cx + size, cy), (0, 255, 255), 2)
         cv2.line(frame, (cx, cy - size), (cx, cy + size), (0, 255, 255), 2)
         cv2.circle(frame, (cx, cy), 5, (0, 255, 255), -1)
@@ -105,22 +117,40 @@ class EyeShooterApp:
             cv2.putText(frame, state_text, (w // 2 - 250, h // 2), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 2)
         
+        # 眨眼指示器
+        if self.last_blink_time > 0 and self.frame_count - self.last_blink_time < 8:
+            # 眨眼闪光效果
+            flash_alpha = (8 - (self.frame_count - self.last_blink_time)) / 8.0
+            flash_color = (0, 100 * flash_alpha, 255 * flash_alpha)
+            cv2.circle(frame, (self.game_engine.crosshair_x, self.game_engine.crosshair_y), 
+                      size + 10, flash_color, 2)
+        
         # 调试信息
         if self.show_debug:
-            debug_y = h - 120
+            debug_y = h - 180
             cv2.putText(frame, f"FPS: {self.fps:.1f}", (20, debug_y), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
             
             if self.game_engine.state == GameState.PLAYING:
-                gaze_text = f"Gaze X: {self.game_engine.crosshair_x}, Y: {self.game_engine.crosshair_y}"
+                gaze_text = f"Gaze: ({self.game_engine.crosshair_x}, {self.game_engine.crosshair_y})"
                 targets_text = f"Targets: {len([t for t in self.game_engine.targets if t.alive])}"
+                
                 cv2.putText(frame, gaze_text, (20, debug_y + 30), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
                 cv2.putText(frame, targets_text, (20, debug_y + 60), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                
+                # 显示眼睛宽高比
+                if hasattr(self, 'last_ear_left') and hasattr(self, 'last_ear_right'):
+                    ear_text = f"L-EAR: {self.last_ear_left:.2f} | R-EAR: {self.last_ear_right:.2f}"
+                    threshold_text = f"Blink Threshold: {self.gaze_tracker.EAR_THRESHOLD:.2f}"
+                    cv2.putText(frame, ear_text, (20, debug_y + 90), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                    cv2.putText(frame, threshold_text, (20, debug_y + 120), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
         
         # 帮助信息
-        help_text = "Press D for debug | L for landmarks | ESC to quit"
+        help_text = "Space:Start | D:Debug | L:Landmarks | R:Reset | ESC:Quit"
         cv2.putText(frame, help_text, (20, h - 20), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
         
@@ -137,19 +167,29 @@ class EyeShooterApp:
                     print("Failed to read frame from camera")
                     break
                 
-                # 处理每一帧
-                gaze_result = self.gaze_tracker.process_frame(frame)
+                # 处理每一帧 - 传入帧ID用于眨眼冷却计算
+                gaze_result = self.gaze_tracker.process_frame(frame, self.frame_count)
+                
+                # 保存EAR用于调试显示
+                self.last_ear_left = gaze_result['left_eye_ear'] or 0
+                self.last_ear_right = gaze_result['right_eye_ear'] or 0
                 
                 # 更新游戏
-                fire_trigger = gaze_result['blink_detected']
-                gaze_coords = gaze_result['gaze_screen_coords'] if gaze_result['face_detected'] else \
-                             (self.game_engine.crosshair_x, self.game_engine.crosshair_y)
+                fire_trigger = gaze_result['blink_triggered']  # 使用真正触发的射击
                 
-                # 如果没有检测到脸，使用上一次的准心位置
-                if gaze_coords is None:
+                # 获取准心坐标
+                if gaze_result['face_detected'] and gaze_result['gaze_screen_coords']:
+                    gaze_coords = gaze_result['gaze_screen_coords']
+                else:
+                    # 没有检测到脸，保持上一次的准心位置
                     gaze_coords = (self.game_engine.crosshair_x, self.game_engine.crosshair_y)
                 
+                # 更新游戏状态
                 game_state = self.game_engine.update(gaze_coords, fire_trigger)
+                
+                # 记录眨眼时间（用于UI反馈）
+                if fire_trigger:
+                    self.last_blink_time = self.frame_count
                 
                 # 绘制UI
                 frame = self.draw_ui(frame)
@@ -197,6 +237,14 @@ class EyeShooterApp:
                 elif key == ord('r'):  # R - 重置游戏
                     self.game_engine.reset()
                     print("Game reset")
+                
+                elif key == ord('-'):  # 降低眨眼阈值
+                    self.gaze_tracker.EAR_THRESHOLD = max(0.1, self.gaze_tracker.EAR_THRESHOLD - 0.02)
+                    print(f"EAR Threshold: {self.gaze_tracker.EAR_THRESHOLD:.2f}")
+                
+                elif key == ord('='):  # 提高眨眼阈值
+                    self.gaze_tracker.EAR_THRESHOLD = min(0.4, self.gaze_tracker.EAR_THRESHOLD + 0.02)
+                    print(f"EAR Threshold: {self.gaze_tracker.EAR_THRESHOLD:.2f}")
         
         except KeyboardInterrupt:
             print("\nInterrupted by user")
