@@ -1,15 +1,17 @@
 """
-Eye Gaze Tracking Module
-使用 OpenCV Haar Cascade 和基础眼动检测进行眼球追踪
-计算视线向量（gaze vector）和眨眼检测
+Eye Gaze Tracking Module with ML-based Calibration
+使用 OpenCV Haar Cascade 和机器学习模型进行眼球追踪
+实现精准的视线到屏幕坐标的映射
 """
 
 import cv2
 import numpy as np
 from typing import Tuple, Optional, Dict, List
 from collections import deque
+import os
+import joblib
 
-# 加载 Haar Cascade 分类器（用于人脸和眼睛检测）
+# 加载 Haar Cascade 分类器
 FACE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 EYE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_eye.xml'
 
@@ -23,18 +25,20 @@ except Exception as e:
 
 
 class GazeTracker:
-    """眼动追踪器 - 基于OpenCV Haar Cascade眼睛检测"""
+    """眼动追踪器 - 基于OpenCV Haar Cascade + 机器学习模型"""
     
-    def __init__(self, camera_width: int = 1280, camera_height: int = 720):
+    def __init__(self, camera_width: int = 1280, camera_height: int = 720, model_path: str = 'gaze_model.pkl'):
         """
         初始化眼动追踪器
         
         Args:
             camera_width: 摄像头宽度
             camera_height: 摄像头高度
+            model_path: 预训练模型路径
         """
         self.camera_width = camera_width
         self.camera_height = camera_height
+        self.model_path = model_path
         
         if face_cascade is None or eye_cascade is None:
             raise RuntimeError("Failed to load Haar cascades. OpenCV may not be properly installed.")
@@ -43,12 +47,12 @@ class GazeTracker:
         self.eye_cascade = eye_cascade
         
         # 眨眼检测参数
-        self.EAR_THRESHOLD = 0.18  # Eye Aspect Ratio threshold
-        self.BLINK_CONSEC_FRAMES = 2  # 连续帧数阈值
+        self.EAR_THRESHOLD = 0.18
+        self.BLINK_CONSEC_FRAMES = 2
         self.blink_counter = 0
         self.blink_detected = False
-        self.last_blink_frame = -10  # 上一次眨眼的帧数
-        self.blink_cooldown = 5  # 眨眼冷却时间（帧数）
+        self.last_blink_frame = -10
+        self.blink_cooldown = 5
         
         # 视线向量平滑
         self.gaze_smooth_buffer = deque(maxlen=7)
@@ -56,46 +60,241 @@ class GazeTracker:
         self.prev_gaze_coords = None
         self.coord_smooth_factor = 0.5
         
-        # 校准参数
+        # 校准和模型相关
         self.calibrated = False
-        self.calibration_points = []
-        self.screen_points = []
+        self.gaze_model = None
+        self.model_trained = False
+        self.training_data = []
+        self.training_labels = []
+        
+        # 校准点配置
+        self.calibration_points = [
+            (0.1, 0.1), (0.5, 0.1), (0.9, 0.1),
+            (0.1, 0.5), (0.5, 0.5), (0.9, 0.5),
+            (0.1, 0.9), (0.5, 0.9), (0.9, 0.9)
+        ]
+        self.current_calibration_point = 0
+        self.calibrating = False
+        self.calibration_samples_per_point = 10
+        self.current_point_samples = 0
         
         # 调试信息
         self.last_ear_left = 0.0
         self.last_ear_right = 0.0
         
-        # 摄像头位置补正
-        self.camera_height_offset = -0.15
-        
-        # 眼睛位置历史（用于平滑）
+        # 眼睛位置历史
         self.left_eye_history = deque(maxlen=5)
         self.right_eye_history = deque(maxlen=5)
+        self.eye_feature_history = deque(maxlen=10)
         
-        # 上一帧的眼睛状态
-        self.prev_left_eye_state = None
-        self.prev_right_eye_state = None
+        # 保存眼睛矩形用于特征提取
+        self.last_left_eye_rect = None
+        self.last_right_eye_rect = None
+        self.last_face_rect = None
         
-    def calculate_eye_aspect_ratio(self, eye_region: np.ndarray) -> float:
+        # 尝试加载预训练模型
+        self._load_model()
+    
+    def _load_model(self):
+        """加载预训练的模型"""
+        if os.path.exists(self.model_path):
+            try:
+                self.gaze_model = joblib.load(self.model_path)
+                self.model_trained = True
+                print(f"[*] Model loaded: {self.model_path}")
+            except Exception as e:
+                print(f"[!] Failed to load model {self.model_path}: {e}")
+                self.model_trained = False
+        else:
+            print(f"[i] Model not found {self.model_path}, using geometric method")
+    
+    def _save_model(self):
+        """保存训练好的模型"""
+        if self.gaze_model is not None:
+            joblib.dump(self.gaze_model, self.model_path)
+            print(f"✓ 模型已保存：{self.model_path}")
+    
+    def extract_eye_features(self, left_eye_rect: Tuple, right_eye_rect: Tuple, face_rect: Tuple) -> Optional[np.ndarray]:
         """
-        基于眼睛区域计算眼睛宽高比
+        提取眼睛特征用于模型训练和预测
         
         Args:
-            eye_region: 眼睛ROI区域
+            left_eye_rect: 左眼矩形 (x, y, w, h)
+            right_eye_rect: 右眼矩形 (x, y, w, h)
+            face_rect: 脸部矩形 (x, y, w, h)
             
         Returns:
-            眼睛宽高比（0-1）
+            眼睛特征向量
         """
+        if not all([left_eye_rect, right_eye_rect, face_rect]):
+            return None
+        
+        lx, ly, lw, lh = left_eye_rect
+        rx, ry, rw, rh = right_eye_rect
+        fx, fy, fw, fh = face_rect
+        
+        features = []
+        
+        # 1. 眼睛中心位置（相对脸部）
+        left_center_x = (lx + lw / 2 - fx) / fw
+        left_center_y = (ly + lh / 2 - fy) / fh
+        right_center_x = (rx + rw / 2 - fx) / fw
+        right_center_y = (ry + rh / 2 - fy) / fh
+        
+        features.extend([left_center_x, left_center_y, right_center_x, right_center_y])
+        
+        # 2. 眼睛大小（相对脸部大小）
+        left_size = (lw * lh) / (fw * fh)
+        right_size = (rw * rh) / (fw * fh)
+        features.extend([left_size, right_size])
+        
+        # 3. 眼睛宽高比
+        left_aspect = lw / max(lh, 1)
+        right_aspect = rw / max(rh, 1)
+        features.extend([left_aspect, right_aspect])
+        
+        # 4. 两眼间距
+        eye_distance = np.sqrt((left_center_x - right_center_x) ** 2 + 
+                              (left_center_y - right_center_y) ** 2)
+        features.append(eye_distance)
+        
+        # 5. 历史特征（平均和方差）
+        if len(self.eye_feature_history) > 0:
+            history_array = np.array(self.eye_feature_history)
+            mean_features = np.mean(history_array, axis=0)
+            std_features = np.std(history_array, axis=0)
+            features.extend(mean_features.tolist())
+            features.extend(std_features.tolist())
+        else:
+            features.extend([0] * (len(features) * 2))
+        
+        # 保存基础特征到历史
+        self.eye_feature_history.append(features[:9])
+        
+        return np.array(features, dtype=np.float32)
+    
+    def start_calibration(self):
+        """开始校准流程"""
+        print("\n" + "="*60)
+        print("开始眼动校准 - 请依次看屏幕上出现的9个点")
+        print("每个点显示时请尽量凝视，系统将自动采集样本")
+        print("="*60 + "\n")
+        
+        self.calibrating = True
+        self.current_calibration_point = 0
+        self.current_point_samples = 0
+        self.training_data = []
+        self.training_labels = []
+    
+    def add_calibration_sample(self, eye_features: np.ndarray, screen_width: int, screen_height: int) -> bool:
+        """添加校准样本"""
+        if not self.calibrating or eye_features is None:
+            return False
+        
+        if self.current_calibration_point >= len(self.calibration_points):
+            return False
+        
+        # 获取当前校准点的目标坐标
+        x_ratio, y_ratio = self.calibration_points[self.current_calibration_point]
+        target_x = x_ratio * screen_width
+        target_y = y_ratio * screen_height
+        
+        # 添加样本
+        self.training_data.append(eye_features)
+        self.training_labels.append([target_x, target_y])
+        
+        self.current_point_samples += 1
+        
+        # 检查是否完成当前点的采集
+        if self.current_point_samples >= self.calibration_samples_per_point:
+            print(f"✓ 点 {self.current_calibration_point + 1}/{len(self.calibration_points)} 采集完成")
+            self.current_calibration_point += 1
+            self.current_point_samples = 0
+            
+            # 检查是否完成所有点
+            if self.current_calibration_point >= len(self.calibration_points):
+                print("\n✓ 校准数据采集完成！")
+                return self.train_gaze_model()
+        
+        return True
+    
+    def train_gaze_model(self) -> bool:
+        """训练视线映射模型"""
+        min_samples = len(self.calibration_points) * self.calibration_samples_per_point
+        
+        if len(self.training_data) < min_samples:
+            print(f"⚠ 样本不足: 需要{min_samples}个，仅有{len(self.training_data)}个")
+            return False
+        
+        try:
+            from sklearn.neural_network import MLPRegressor
+            
+            X = np.array(self.training_data)
+            y = np.array(self.training_labels)
+            
+            # 使用神经网络模型
+            self.gaze_model = MLPRegressor(
+                hidden_layer_sizes=(128, 64, 32),
+                activation='relu',
+                solver='adam',
+                max_iter=2000,
+                random_state=42,
+                early_stopping=True,
+                validation_fraction=0.2,
+                n_iter_no_change=100
+            )
+            
+            self.gaze_model.fit(X, y)
+            self.model_trained = True
+            
+            # 评估模型
+            train_score = self.gaze_model.score(X, y)
+            print(f"[*] Model trained successfully")
+            print(f"  - Samples: {len(X)}")
+            print(f"  - Accuracy: {train_score:.4f}")
+            
+            # 保存模型
+            self._save_model()
+            
+            self.calibrating = False
+            return True
+            
+        except ImportError:
+            print("⚠ sklearn 未安装，请运行: pip install scikit-learn")
+            return False
+        except Exception as e:
+            print(f"✗ 模型训练失败: {e}")
+            return False
+    
+    def predict_gaze_with_model(self, eye_features: np.ndarray, screen_width: int, screen_height: int) -> Optional[Tuple[int, int]]:
+        """使用训练好的模型预测视线位置"""
+        if not self.model_trained or self.gaze_model is None or eye_features is None:
+            return None
+        
+        try:
+            X = np.array([eye_features])
+            prediction = self.gaze_model.predict(X)[0]
+            
+            # 约束到屏幕范围
+            screen_x = int(np.clip(prediction[0], 0, screen_width))
+            screen_y = int(np.clip(prediction[1], 0, screen_height))
+            
+            return (screen_x, screen_y)
+            
+        except Exception as e:
+            print(f"预测错误: {e}")
+            return None
+    
+    def calculate_eye_aspect_ratio(self, eye_region: np.ndarray) -> float:
+        """基于眼睛区域计算眼睛宽高比"""
         if eye_region is None or eye_region.size == 0:
             return 1.0
         
-        # 计算眼睛区域的填充比例（作为宽高比的代理）
-        # 眼睛闭合时，区域会变小或变暗
         h, w = eye_region.shape[:2]
         if h == 0 or w == 0:
             return 1.0
         
-        # 计算区域的亮度平均值（眼睛打开时较亮）
+        # 计算区域的亮度平均值
         gray = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY) if len(eye_region.shape) == 3 else eye_region
         brightness = np.mean(gray) / 255.0
         
@@ -106,21 +305,11 @@ class GazeTracker:
         ear = brightness * aspect_ratio
         return ear
     
-    def smooth_eye_position(self, eye_rect: Tuple[int, int, int, int], is_left: bool = True) -> Optional[Tuple[int, int, int, int]]:
-        """
-        平滑眼睛位置以减少检测噪声
-        
-        Args:
-            eye_rect: 眼睛矩形 (x, y, w, h)
-            is_left: 是否为左眼
-            
-        Returns:
-            平滑后的眼睛位置或None
-        """
+    def smooth_eye_position(self, eye_rect: Tuple, is_left: bool = True) -> Optional[Tuple]:
+        """平滑眼睛位置"""
         if eye_rect is None:
             return None
         
-        # 使用历史缓冲区平滑
         history = self.left_eye_history if is_left else self.right_eye_history
         history.append(eye_rect)
         
@@ -134,17 +323,7 @@ class GazeTracker:
         return None
     
     def estimate_gaze_vector(self, left_eye_rect: Tuple, right_eye_rect: Tuple, face_rect: Tuple) -> np.ndarray:
-        """
-        基于眼睛位置估计视线向量
-        
-        Args:
-            left_eye_rect: 左眼矩形 (x, y, w, h)
-            right_eye_rect: 右眼矩形 (x, y, w, h)
-            face_rect: 脸部矩形 (x, y, w, h)
-            
-        Returns:
-            归一化的视线向量 (2,)，范围约为 [-1, 1]
-        """
+        """几何方法估计视线向量（备选方案）"""
         if left_eye_rect is None or right_eye_rect is None:
             return np.array([0.0, 0.0], dtype=np.float32)
         
@@ -162,17 +341,12 @@ class GazeTracker:
         face_center_x = face_rect[0] + face_rect[2] // 2
         face_center_y = face_rect[1] + face_rect[3] // 2
         
-        # 计算相对于脸部中心的眼睛位置（归一化）
-        # X: -1 (左) 到 1 (右)
-        # Y: -1 (上) 到 1 (下)
+        # 计算相对位置
         max_horizontal_offset = face_rect[2] / 3.0
         max_vertical_offset = face_rect[3] / 4.0
         
         gaze_x = (avg_eye_x - face_center_x) / max_horizontal_offset
         gaze_y = (avg_eye_y - face_center_y) / max_vertical_offset
-        
-        # 应用摄像头位置补正
-        gaze_y += self.camera_height_offset
         
         # 约束范围
         gaze_x = np.clip(gaze_x, -1.0, 1.0)
@@ -186,106 +360,62 @@ class GazeTracker:
         return gaze_vector
     
     def _smooth_gaze_vector(self, gaze_vector: np.ndarray) -> np.ndarray:
-        """
-        使用多级低通滤波平滑视线向量，减少噪声和抖动
-        
-        Args:
-            gaze_vector: 当前视线向量
-            
-        Returns:
-            平滑后的视线向量
-        """
+        """平滑视线向量"""
         self.gaze_smooth_buffer.append(gaze_vector)
         
         if len(self.gaze_smooth_buffer) < 2:
             return gaze_vector
         
-        # 级联平滑：首先做简单移动平均
         smoothed = np.mean(list(self.gaze_smooth_buffer), axis=0)
-        
         return smoothed
     
-    def gaze_to_screen_coords(self, 
-                             gaze_vector: np.ndarray,
-                             screen_width: int,
-                             screen_height: int) -> Tuple[int, int]:
-        """
-        改进的视线向量到屏幕坐标映射，考虑眼睛的非线性特性
-        和摄像头位置（屏幕正上方）
-        
-        Args:
-            gaze_vector: 归一化的视线向量 (2,) 范围约 [-1, 1]
-            screen_width: 屏幕宽度
-            screen_height: 屏幕高度
-            
-        Returns:
-            屏幕上的坐标 (x, y)
-        """
+    def gaze_to_screen_coords(self, gaze_vector: np.ndarray, screen_width: int, screen_height: int) -> Tuple[int, int]:
+        """将视线向量映射到屏幕坐标（几何方法）"""
         gx, gy = gaze_vector[0], gaze_vector[1]
         
-        # 非线性变换：使用立方函数增强中心响应，改善边缘精度
-        # 这模仿了眼睛在中央视野区域的更细致控制
-        gx_nonlinear = np.sign(gx) * (abs(gx) ** 0.9)  # 稍微压缩非线性
+        # 非线性变换
+        gx_nonlinear = np.sign(gx) * (abs(gx) ** 0.9)
         gy_nonlinear = np.sign(gy) * (abs(gy) ** 0.9)
         
         # 映射到屏幕坐标
-        # X轴：[-1, 1] -> [0, width]，中心为 0.5 * width
         screen_x = (gx_nonlinear + 1.0) / 2.0 * screen_width
-        
-        # Y轴：[-0.8, 0.8] -> [0, height]，因为垂直视野范围较小
-        # 调整以适应摄像头在屏幕上方的情况
         screen_y = (gy_nonlinear + 0.8) / 1.6 * screen_height
         
-        # 应用坐标级别的平滑，防止准心在眼睛停止时还在跳跃
+        # 应用坐标级别的平滑
         if self.prev_gaze_coords is not None:
             prev_x, prev_y = self.prev_gaze_coords
-            # 加权平均：根据移动距离调整平滑度
             distance = np.sqrt((screen_x - prev_x)**2 + (screen_y - prev_y)**2)
             
-            # 如果移动距离很小，增加平滑度（防止抖动）
-            if distance < 30:  # 像素
+            if distance < 30:
                 smooth_factor = 0.6
             elif distance < 100:
                 smooth_factor = 0.4
             else:
-                smooth_factor = 0.2  # 大幅移动时减少平滑度以保持响应性
+                smooth_factor = 0.2
             
             screen_x = prev_x * smooth_factor + screen_x * (1 - smooth_factor)
             screen_y = prev_y * smooth_factor + screen_y * (1 - smooth_factor)
         
         self.prev_gaze_coords = (screen_x, screen_y)
         
-        # 约束在屏幕范围内，留有安全边距
+        # 约束在屏幕范围内
         screen_x = np.clip(screen_x, 5, screen_width - 5)
         screen_y = np.clip(screen_y, 5, screen_height - 5)
         
         return int(screen_x), int(screen_y)
     
     def detect_left_blink(self, left_eye_region: np.ndarray, frame_id: int = 0) -> bool:
-        """
-        基于眼睛区域的眨眼检测
-        
-        Args:
-            left_eye_region: 左眼ROI区域
-            frame_id: 当前帧ID
-            
-        Returns:
-            是否检测到左眼眨眼
-        """
+        """检测左眼眨眼"""
         if left_eye_region is None or left_eye_region.size == 0:
             return False
         
-        # 计算左眼的宽高比
         ear = self.calculate_eye_aspect_ratio(left_eye_region)
         self.last_ear_left = ear
         
-        # 检测眨眼：EAR下降
         if ear < self.EAR_THRESHOLD:
             self.blink_counter += 1
         else:
-            # 眼睛打开
             if self.blink_counter >= self.BLINK_CONSEC_FRAMES:
-                # 检查冷却时间
                 if frame_id - self.last_blink_frame > self.blink_cooldown:
                     self.blink_detected = True
                     self.last_blink_frame = frame_id
@@ -294,15 +424,7 @@ class GazeTracker:
         return self.blink_detected
     
     def detect_right_blink(self, right_eye_region: np.ndarray) -> bool:
-        """
-        右眼眨眼检测
-        
-        Args:
-            right_eye_region: 右眼ROI区域
-            
-        Returns:
-            是否检测到右眼眨眼
-        """
+        """检测右眼眨眼"""
         if right_eye_region is None or right_eye_region.size == 0:
             return False
         
@@ -314,16 +436,7 @@ class GazeTracker:
         return False
     
     def process_frame(self, frame: np.ndarray, frame_id: int = 0) -> Dict:
-        """
-        处理单帧图像，检测人脸和眼睛，计算视线
-        
-        Args:
-            frame: 输入图像 (H, W, 3) BGR格式
-            frame_id: 当前帧ID
-            
-        Returns:
-            包含追踪结果的字典
-        """
+        """处理单帧图像"""
         h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
@@ -336,7 +449,9 @@ class GazeTracker:
             'left_eye_ear': None,
             'right_eye_ear': None,
             'face_confidence': 0.0,
-            'blink_triggered': False
+            'blink_triggered': False,
+            'calibrating': self.calibrating,
+            'model_trained': self.model_trained
         }
         
         try:
@@ -354,6 +469,8 @@ class GazeTracker:
                 (fx, fy, fw, fh) = faces[0]
                 result_dict['face_detected'] = True
                 result_dict['face_confidence'] = 0.8
+                
+                self.last_face_rect = (fx, fy, fw, fh)
                 
                 # 在人脸区域中检测眼睛
                 face_roi = gray[fy:fy + fh, fx:fx + fw]
@@ -391,20 +508,42 @@ class GazeTracker:
                     right_eye_rect = self.smooth_eye_position(right_eye_rect, is_left=False)
                     
                     if left_eye_rect is not None and right_eye_rect is not None:
-                        # 提取眼睛区域用于EAR计算
+                        # 保存眼睛矩形
+                        self.last_left_eye_rect = left_eye_rect
+                        self.last_right_eye_rect = right_eye_rect
+                        
+                        # 提取眼睛区域
                         lx, ly, lw, lh = left_eye_rect
                         rx, ry, rw, rh = right_eye_rect
                         
                         left_eye_region = frame[ly:ly + lh, lx:lx + lw]
                         right_eye_region = frame[ry:ry + rh, rx:rx + rw]
                         
-                        # 计算视线向量
-                        gaze_vector = self.estimate_gaze_vector(left_eye_rect, right_eye_rect, (fx, fy, fw, fh))
-                        result_dict['gaze_vector'] = gaze_vector
+                        # 提取眼睛特征
+                        eye_features = self.extract_eye_features(left_eye_rect, right_eye_rect, (fx, fy, fw, fh))
                         
-                        # 转换为屏幕坐标
-                        screen_coords = self.gaze_to_screen_coords(gaze_vector, w, h)
-                        result_dict['gaze_screen_coords'] = screen_coords
+                        # 校准模式
+                        if self.calibrating:
+                            self.add_calibration_sample(eye_features, w, h)
+                        
+                        # 使用模型预测或几何方法
+                        if self.model_trained and eye_features is not None:
+                            # 使用ML模型预测
+                            screen_coords = self.predict_gaze_with_model(eye_features, w, h)
+                            
+                            if screen_coords:
+                                result_dict['gaze_screen_coords'] = screen_coords
+                                # 从屏幕坐标反推视线向量
+                                gaze_x = (screen_coords[0] / w * 2) - 1
+                                gaze_y = (screen_coords[1] / h * 2) - 1
+                                result_dict['gaze_vector'] = np.array([gaze_x, gaze_y], dtype=np.float32)
+                        else:
+                            # 使用几何方法（备选）
+                            gaze_vector = self.estimate_gaze_vector(left_eye_rect, right_eye_rect, (fx, fy, fw, fh))
+                            result_dict['gaze_vector'] = gaze_vector
+                            
+                            screen_coords = self.gaze_to_screen_coords(gaze_vector, w, h)
+                            result_dict['gaze_screen_coords'] = screen_coords
                         
                         # 检测眨眼
                         blink_state = self.detect_left_blink(left_eye_region, frame_id)
@@ -412,7 +551,7 @@ class GazeTracker:
                         
                         if blink_state:
                             result_dict['blink_triggered'] = True
-                            self.blink_detected = False  # 重置
+                            self.blink_detected = False
                         
                         # 获取EAR值
                         self.detect_right_blink(right_eye_region)
@@ -421,21 +560,11 @@ class GazeTracker:
         
         except Exception as e:
             print(f"Error in process_frame: {e}")
-            pass
         
         return result_dict
     
     def draw_landmarks(self, frame: np.ndarray, landmarks: np.ndarray = None) -> np.ndarray:
-        """
-        在图像上绘制眼睛检测区域（用于调试）
-        
-        Args:
-            frame: 输入图像
-            landmarks: 面部特征点坐标（此参数在Haar Cascade版本中未使用）
-            
-        Returns:
-            绘制后的图像
-        """
+        """绘制眼睛检测区域"""
         h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
@@ -460,7 +589,14 @@ class GazeTracker:
             for (ex, ey, ew, eh) in eyes:
                 cv2.rectangle(frame, (fx + ex, fy + ey), (fx + ex + ew, fy + ey + eh), (0, 255, 0), 2)
         
-        cv2.putText(frame, "OpenCV Haar Cascade Eye Tracking", (10, 30),
+        # 显示状态
+        status_text = "ML Model" if self.model_trained else "Geometric Method"
+        cv2.putText(frame, f"Eye Tracking - {status_text}", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        if self.calibrating:
+            calib_text = f"CALIBRATING: Point {self.current_calibration_point + 1}/{len(self.calibration_points)}"
+            cv2.putText(frame, calib_text, (10, 70),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         
         return frame

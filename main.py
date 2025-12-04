@@ -65,13 +65,14 @@ class EyeShooterApp:
         self.locked_crosshair_y = None
         
         print("=" * 60)
-        print("Eye Shooter - Gaze-Controlled Shooting Game")
+        print("Eye Shooter - Gaze-Controlled Shooting Game (ML Edition)")
         print("=" * 60)
         print("\nControls:")
         print("  Space: Start/Pause/Resume game")
         print("  D: Toggle debug info")
         print("  L: Toggle landmarks display")
         print("  R: Reset game")
+        print("  C: Calibrate gaze tracking (ML training)")
         print("  -/=: Adjust blink sensitivity")
         print("  ESC: Quit")
         print("\nGame Rules:")
@@ -81,6 +82,7 @@ class EyeShooterApp:
         print("  - Game becomes harder as you level up")
         print("\n" + "=" * 60)
         print("Tips:")
+        print("  - First time? Press 'C' to calibrate for best accuracy")
         print("  - Good lighting improves face detection")
         print("  - Keep your face at 30-60cm from camera")
         print("  - Use - and = keys to adjust blink sensitivity")
@@ -132,30 +134,35 @@ class EyeShooterApp:
         
         # 调试信息
         if self.show_debug:
-            debug_y = h - 180
+            debug_y = h - 220
             cv2.putText(frame, f"FPS: {self.fps:.1f}", (20, debug_y), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            
+            # 显示模型状态
+            model_status = "✓ ML Model" if self.gaze_tracker.model_trained else "○ Geometric"
+            cv2.putText(frame, f"Mode: {model_status}", (20, debug_y + 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
             
             if self.game_engine.state == GameState.PLAYING:
                 gaze_text = f"Gaze: ({self.game_engine.crosshair_x}, {self.game_engine.crosshair_y})"
                 targets_text = f"Targets: {len([t for t in self.game_engine.targets if t.alive])}"
                 
-                cv2.putText(frame, gaze_text, (20, debug_y + 30), 
+                cv2.putText(frame, gaze_text, (20, debug_y + 60), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-                cv2.putText(frame, targets_text, (20, debug_y + 60), 
+                cv2.putText(frame, targets_text, (20, debug_y + 90), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
                 
                 # 显示眼睛宽高比
                 if hasattr(self, 'last_ear_left') and hasattr(self, 'last_ear_right'):
                     ear_text = f"L-EAR: {self.last_ear_left:.2f} | R-EAR: {self.last_ear_right:.2f}"
                     threshold_text = f"Blink Threshold: {self.gaze_tracker.EAR_THRESHOLD:.2f}"
-                    cv2.putText(frame, ear_text, (20, debug_y + 90), 
+                    cv2.putText(frame, ear_text, (20, debug_y + 120), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-                    cv2.putText(frame, threshold_text, (20, debug_y + 120), 
+                    cv2.putText(frame, threshold_text, (20, debug_y + 150), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
         
         # 帮助信息
-        help_text = "Space:Start | D:Debug | L:Landmarks | R:Reset | ESC:Quit"
+        help_text = "Space:Start | D:Debug | L:Landmarks | C:Calibrate | R:Reset | ESC:Quit"
         cv2.putText(frame, help_text, (20, h - 20), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
         
@@ -261,6 +268,10 @@ class EyeShooterApp:
                 elif key == ord('='):  # 提高眨眼阈值
                     self.gaze_tracker.EAR_THRESHOLD = min(0.4, self.gaze_tracker.EAR_THRESHOLD + 0.02)
                     print(f"EAR Threshold: {self.gaze_tracker.EAR_THRESHOLD:.2f}")
+                
+                elif key == ord('c'):  # C - 开始校准
+                    print("\nStarting calibration...")
+                    self.gaze_tracker.start_calibration()
         
         except KeyboardInterrupt:
             print("\nInterrupted by user")
