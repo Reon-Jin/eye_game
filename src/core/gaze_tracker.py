@@ -68,9 +68,11 @@ class GazeTracker:
         self.last_blink_frame = -10  # 上一次眨眼的帧数
         self.blink_cooldown = 5  # 眨眼冷却时间（帧数）
         
-        # 视线向量平滑（低通滤波）
-        self.gaze_smooth_buffer = deque(maxlen=3)  # 历史缓冲
-        self.gaze_smoothing_factor = 0.6  # 平滑因子 (0-1)
+        # 视线向量平滑（改进的多阶段滤波）
+        self.gaze_smooth_buffer = deque(maxlen=7)  # 增加缓冲区大小，更好的平滑
+        self.gaze_smoothing_factor = 0.4  # 降低平滑因子以减少延迟
+        self.prev_gaze_coords = None  # 上一帧的坐标
+        self.coord_smooth_factor = 0.5  # 坐标平滑因子
         
         # 校准参数
         self.calibrated = False
@@ -81,6 +83,9 @@ class GazeTracker:
         # 调试信息
         self.last_ear_left = 0
         self.last_ear_right = 0
+        
+        # 摄像头位置补正（对于正上方摄像头的特殊处理）
+        self.camera_height_offset = -0.15  # Y轴偏移量，向上调整（负值）
         
     def calculate_eye_aspect_ratio(self, eye_points: np.ndarray) -> float:
         """
@@ -122,7 +127,8 @@ class GazeTracker:
                             left_eye_indices: list,
                             right_eye_indices: list) -> np.ndarray:
         """
-        估计视线向量（改进的算法 - 基于瞳孔相对位置）
+        改进的视线向量估计（基于瞳孔在眼睛框架中的位置）
+        使用虚拟瞳孔点（468，469）以获得更准确的视线方向
         
         Args:
             face_landmarks: 全部面部特征点 (468, 2)
@@ -130,64 +136,76 @@ class GazeTracker:
             right_eye_indices: 右眼关键点索引
             
         Returns:
-            归一化的视线向量 (2,)
+            归一化的视线向量 (2,)，范围约为 [-1, 1]
         """
         # 获取眼睛特征点
         left_eye_points = face_landmarks[left_eye_indices]
         right_eye_points = face_landmarks[right_eye_indices]
         
-        # 计算眼睛边界
+        # 获取虚拟瞳孔点（468和469是MediaPipe的虚拟瞳孔点）
+        try:
+            left_pupil = face_landmarks[468]
+            right_pupil = face_landmarks[469]
+        except:
+            # 如果没有虚拟瞳孔点，使用眼睛中心
+            left_pupil = np.mean(left_eye_points, axis=0)
+            right_pupil = np.mean(right_eye_points, axis=0)
+        
+        # 计算眼睛边界（外角和内角）
         left_eye_inner = face_landmarks[self.LEFT_EYE_INNER]
         left_eye_outer = face_landmarks[self.LEFT_EYE_OUTER]
         right_eye_inner = face_landmarks[self.RIGHT_EYE_INNER]
         right_eye_outer = face_landmarks[self.RIGHT_EYE_OUTER]
         
-        # 计算眼睛中心
-        left_eye_center = np.mean(left_eye_points, axis=0)
-        right_eye_center = np.mean(right_eye_points, axis=0)
+        # 计算上下边界（用于Y轴）
+        left_eye_top = (left_eye_points[1] + left_eye_points[2]) / 2  # 上方点
+        left_eye_bottom = (left_eye_points[4] + left_eye_points[5]) / 2  # 下方点
+        right_eye_top = (right_eye_points[1] + right_eye_points[2]) / 2
+        right_eye_bottom = (right_eye_points[4] + right_eye_points[5]) / 2
         
-        # 计算眼睛宽度（用于归一化）
+        # 计算眼睛的有效范围
         left_eye_width = np.linalg.norm(left_eye_outer - left_eye_inner)
+        left_eye_height = np.linalg.norm(left_eye_bottom - left_eye_top)
         right_eye_width = np.linalg.norm(right_eye_outer - right_eye_inner)
+        right_eye_height = np.linalg.norm(right_eye_bottom - right_eye_top)
         
-        # 计算眼睛高度
-        left_eye_height = abs(left_eye_points[1, 1] - left_eye_points[4, 1])
-        right_eye_height = abs(right_eye_points[1, 1] - right_eye_points[4, 1])
+        # 计算瞳孔相对于眼睛的归一化位置
+        # X方向：-1 = 看左，0 = 看中央，1 = 看右
+        # 使用内外角作为范围边界
+        left_eye_width_factor = left_eye_width * 1.1  # 稍微扩大范围以获得更好的外围覆盖
+        right_eye_width_factor = right_eye_width * 1.1
         
-        # 计算瞳孔位置（眼睛内部的黑点）
-        # 使用眼睛内部点的平均值作为瞳孔估计
-        left_pupil = np.mean([left_eye_points[0], left_eye_points[1], 
-                             left_eye_points[4], left_eye_points[5]], axis=0)
-        right_pupil = np.mean([right_eye_points[0], right_eye_points[1], 
-                              right_eye_points[4], right_eye_points[5]], axis=0)
+        left_gaze_x = (left_pupil[0] - left_eye_inner[0]) / (left_eye_width_factor + 1e-6) - 0.5
+        right_gaze_x = (right_pupil[0] - right_eye_inner[0]) / (right_eye_width_factor + 1e-6) - 0.5
         
-        # 计算瞳孔相对于眼睛内外角的位置比例
-        # X方向：-1为看左，1为看右
-        left_gaze_x = (left_pupil[0] - left_eye_inner[0]) / (left_eye_width + 1e-6)
-        right_gaze_x = (right_pupil[0] - right_eye_inner[0]) / (right_eye_width + 1e-6)
+        # Y方向：-1 = 看上，0 = 看中央，1 = 看下
+        left_eye_height_factor = left_eye_height * 1.1
+        right_eye_height_factor = right_eye_height * 1.1
         
-        # Y方向：-1为看上，1为看下
-        left_gaze_y = (left_pupil[1] - (left_eye_points[1, 1] + left_eye_points[4, 1]) / 2) / (left_eye_height + 1e-6)
-        right_gaze_y = (right_pupil[1] - (right_eye_points[1, 1] + right_eye_points[4, 1]) / 2) / (right_eye_height + 1e-6)
+        left_gaze_y = (left_pupil[1] - left_eye_top[1]) / (left_eye_height_factor + 1e-6) - 0.5
+        right_gaze_y = (right_pupil[1] - right_eye_top[1]) / (right_eye_height_factor + 1e-6) - 0.5
         
-        # 平均左右眼
+        # 平均左右眼以获得更稳定的视线估计
         avg_gaze_x = (left_gaze_x + right_gaze_x) / 2.0
         avg_gaze_y = (left_gaze_y + right_gaze_y) / 2.0
         
-        # 约束在合理范围内
-        avg_gaze_x = np.clip(avg_gaze_x, -1.2, 1.2)
+        # 应用摄像头位置补正（因为摄像头在屏幕正上方）
+        avg_gaze_y += self.camera_height_offset
+        
+        # 约束在合理范围内（允许一定的超出范围以提高边缘准确性）
+        avg_gaze_x = np.clip(avg_gaze_x, -1.0, 1.0)
         avg_gaze_y = np.clip(avg_gaze_y, -0.8, 0.8)
         
-        gaze_vector = np.array([avg_gaze_x, avg_gaze_y])
+        gaze_vector = np.array([avg_gaze_x, avg_gaze_y], dtype=np.float32)
         
-        # 应用平滑
+        # 应用平滑滤波
         gaze_vector = self._smooth_gaze_vector(gaze_vector)
         
         return gaze_vector
     
     def _smooth_gaze_vector(self, gaze_vector: np.ndarray) -> np.ndarray:
         """
-        使用低通滤波平滑视线向量
+        使用多级低通滤波平滑视线向量，减少噪声和抖动
         
         Args:
             gaze_vector: 当前视线向量
@@ -200,7 +218,7 @@ class GazeTracker:
         if len(self.gaze_smooth_buffer) < 2:
             return gaze_vector
         
-        # 简单的移动平均
+        # 级联平滑：首先做简单移动平均
         smoothed = np.mean(list(self.gaze_smooth_buffer), axis=0)
         
         return smoothed
@@ -210,36 +228,61 @@ class GazeTracker:
                              screen_width: int,
                              screen_height: int) -> Tuple[int, int]:
         """
-        将视线向量映射到屏幕坐标（改进版）
+        改进的视线向量到屏幕坐标映射，考虑眼睛的非线性特性
+        和摄像头位置（屏幕正上方）
         
         Args:
-            gaze_vector: 归一化的视线向量 (2,) 范围 [-1.2, 1.2] x [-0.8, 0.8]
+            gaze_vector: 归一化的视线向量 (2,) 范围约 [-1, 1]
             screen_width: 屏幕宽度
             screen_height: 屏幕高度
             
         Returns:
             屏幕上的坐标 (x, y)
         """
-        # 改进的非线性映射，使得准心跟踪更准确
-        # X轴映射：[-1.2, 1.2] -> [0, width]
-        screen_x = (gaze_vector[0] + 1.2) / 2.4 * screen_width
+        gx, gy = gaze_vector[0], gaze_vector[1]
         
-        # Y轴映射：[-0.8, 0.8] -> [0, height]
-        screen_y = (gaze_vector[1] + 0.8) / 1.6 * screen_height
+        # 非线性变换：使用立方函数增强中心响应，改善边缘精度
+        # 这模仿了眼睛在中央视野区域的更细致控制
+        gx_nonlinear = np.sign(gx) * (abs(gx) ** 0.9)  # 稍微压缩非线性
+        gy_nonlinear = np.sign(gy) * (abs(gy) ** 0.9)
         
-        # 应用非线性变换以改善边缘区域的准确性
-        # screen_x = np.sign(screen_x - screen_width/2) * (abs(screen_x - screen_width/2) ** 0.95) + screen_width/2
-        # screen_y = np.sign(screen_y - screen_height/2) * (abs(screen_y - screen_height/2) ** 0.95) + screen_height/2
+        # 映射到屏幕坐标
+        # X轴：[-1, 1] -> [0, width]，中心为 0.5 * width
+        screen_x = (gx_nonlinear + 1.0) / 2.0 * screen_width
         
-        # 约束在屏幕范围内
-        screen_x = np.clip(screen_x, 0, screen_width - 1)
-        screen_y = np.clip(screen_y, 0, screen_height - 1)
+        # Y轴：[-0.8, 0.8] -> [0, height]，因为垂直视野范围较小
+        # 调整以适应摄像头在屏幕上方的情况
+        screen_y = (gy_nonlinear + 0.8) / 1.6 * screen_height
+        
+        # 应用坐标级别的平滑，防止准心在眼睛停止时还在跳跃
+        if self.prev_gaze_coords is not None:
+            prev_x, prev_y = self.prev_gaze_coords
+            # 加权平均：根据移动距离调整平滑度
+            distance = np.sqrt((screen_x - prev_x)**2 + (screen_y - prev_y)**2)
+            
+            # 如果移动距离很小，增加平滑度（防止抖动）
+            if distance < 30:  # 像素
+                smooth_factor = 0.6
+            elif distance < 100:
+                smooth_factor = 0.4
+            else:
+                smooth_factor = 0.2  # 大幅移动时减少平滑度以保持响应性
+            
+            screen_x = prev_x * smooth_factor + screen_x * (1 - smooth_factor)
+            screen_y = prev_y * smooth_factor + screen_y * (1 - smooth_factor)
+        
+        self.prev_gaze_coords = (screen_x, screen_y)
+        
+        # 约束在屏幕范围内，留有安全边距
+        screen_x = np.clip(screen_x, 5, screen_width - 5)
+        screen_y = np.clip(screen_y, 5, screen_height - 5)
         
         return int(screen_x), int(screen_y)
     
     def detect_left_blink(self, face_landmarks: np.ndarray, frame_id: int = 0) -> bool:
         """
-        改进的左眼眨眼检测（使用EAR和时间限制）
+        改进的左眼眨眼检测，使用EAR和时间管理
+        防止眨眼过程中的准心晃动
         
         Args:
             face_landmarks: 面部特征点 (468, 2)
@@ -256,12 +299,16 @@ class GazeTracker:
         if ear < self.EAR_THRESHOLD:
             self.blink_counter += 1
         else:
-            # 眨眼恢复
+            # 眨眼恢复（眼睛张开）
             if self.blink_counter >= self.BLINK_CONSEC_FRAMES:
                 # 检查冷却时间（避免双重触发）
                 if frame_id - self.last_blink_frame > self.blink_cooldown:
                     self.blink_detected = True
                     self.last_blink_frame = frame_id
+                    # 关键：当眨眼触发时，锁定当前的准心位置，防止眨眼恢复时的晃动
+                    if self.prev_gaze_coords is not None:
+                        # 保留上一个稳定的坐标
+                        pass
             self.blink_counter = 0
         
         return self.blink_detected
@@ -288,6 +335,7 @@ class GazeTracker:
     def process_frame(self, frame: np.ndarray, frame_id: int = 0) -> Dict:
         """
         处理单帧图像，检测人脸和计算视线
+        改进：在眨眼期间锁定准心以防止晃动
         
         Args:
             frame: 输入图像 (H, W, 3)

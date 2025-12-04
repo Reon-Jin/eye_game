@@ -59,6 +59,11 @@ class EyeShooterApp:
         self.last_ear_left = 0
         self.last_ear_right = 0
         
+        # 准心锁定机制（防止眨眼时晃动）
+        self.blink_lock_frames = 6  # 眨眼时锁定准心的帧数
+        self.locked_crosshair_x = None
+        self.locked_crosshair_y = None
+        
         print("=" * 60)
         print("Eye Shooter - Gaze-Controlled Shooting Game")
         print("=" * 60)
@@ -180,16 +185,27 @@ class EyeShooterApp:
                 # 获取准心坐标
                 if gaze_result['face_detected'] and gaze_result['gaze_screen_coords']:
                     gaze_coords = gaze_result['gaze_screen_coords']
+                    
+                    # 眨眼时锁定准心，防止眼睛闭合时的准心晃动
+                    if fire_trigger:
+                        # 记录当前位置作为锁定点
+                        self.locked_crosshair_x = gaze_coords[0]
+                        self.locked_crosshair_y = gaze_coords[1]
+                        self.last_blink_time = self.frame_count
+                    elif (self.locked_crosshair_x is not None and 
+                          self.frame_count - self.last_blink_time < self.blink_lock_frames):
+                        # 在锁定期间，使用锁定的坐标
+                        gaze_coords = (self.locked_crosshair_x, self.locked_crosshair_y)
+                    else:
+                        # 锁定期结束，释放锁定
+                        self.locked_crosshair_x = None
+                        self.locked_crosshair_y = None
                 else:
                     # 没有检测到脸，保持上一次的准心位置
                     gaze_coords = (self.game_engine.crosshair_x, self.game_engine.crosshair_y)
                 
                 # 更新游戏状态
                 game_state = self.game_engine.update(gaze_coords, fire_trigger)
-                
-                # 记录眨眼时间（用于UI反馈）
-                if fire_trigger:
-                    self.last_blink_time = self.frame_count
                 
                 # 绘制UI
                 frame = self.draw_ui(frame)
