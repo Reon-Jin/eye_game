@@ -217,6 +217,10 @@ class EyeShooterApp:
                 # 绘制UI
                 frame = self.draw_ui(frame)
                 
+                # 绘制校准点（校准模式）
+                if self.gaze_tracker.calibrating:
+                    frame = self.gaze_tracker.draw_calibration_ui(frame, self.width, self.height)
+                
                 # 绘制面部特征点（可选调试）
                 if self.show_landmarks and gaze_result['face_detected']:
                     frame = self.gaze_tracker.draw_landmarks(frame, gaze_result['landmarks'])
